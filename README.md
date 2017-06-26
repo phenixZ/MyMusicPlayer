@@ -1,0 +1,2 @@
+# MyMusicPlayer
+copy from cmus
