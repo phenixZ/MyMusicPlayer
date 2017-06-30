@@ -717,6 +717,429 @@ static void _consumer_handle_eof(void)
 	struct track_info *ti;
 
 	if (ip_is_remote(ip)) {
+		_producer_stop();
+		_consumer_drain_and_stop();
+		player_error("lost connection");
+		return;
+	}
 
+	if (player_info_priv.ti)
+		player_info_priv.ti->play_count++;
+
+	if (player_repeat_current) {
+		if (player_cont) {
+			ip_seek(ip, 0);
+			reset_buffer();
+		} else {
+			_producer_stop();
+			_consumer_drain_and_stop();
+			_player_status_changed();
+		}
+		return;
+	}
+
+	if ((ti = cmus_get_next_track())) {
+		_producer_unload();
+		ip = ip_new(ti->filename);
+		_producer_status_update(PS_STOPPED);
+
+		if (player_cont) {
+			_producer_play();
+			if (producer_status == PS_UNLOADED) {
+				_consumer_stop();
+				track_info_unref(ti);
+				file_changed(NULL);
+			} else {
+				file_changed(ti);
+				if (!change_sf(0))
+					_prebuffer();
+			}
+		} else {
+			_consumer_drain_and_stop();
+			file_changed(ti);
+		}
+	} else {
+		_producer_unload();
+		_consumer_drain_and_stop();
+		file_changed(NULL);
+	}
+	_player_status_changed();
+}
+
+
+static void *consumer_loop(void *arg)
+{
+	while (1) {
+		int rc, space;
+		int size;
+		char *rpos;
+
+		consumer_lock();
+		if (!consumer_running)
+			break;
+
+		if (consumer_status == CS_PAUSED || consumer_status == CS_STOPPED) {
+			pthread_cond_wait(&consumer_playing, &consumer_mutex);
+			consumer_unlock();
+			continue;
+		}
+		space = op_buffer_space();
+		if (space < 0) {
+			d_print("op_buffer_space returned %d %s\n", space,
+						space == -1 ? strerror(errno) : "");
+
+			op_close();
+			_consumer_status_update(CS_STOPPED);
+			_consumer_play();
+
+			consumer_unlock();
+			continue;
+		}
+
+		while (1) {
+			if (space == 0) {
+				_consumer_position_update();
+				consumer_unlock();
+				ms_sleep(25);
+				break;
+
+			}
+			size = buffer_get_rpos(&rpos);
+			if (size == 0) {
+				producer_lock();
+				if (producer_status != PS_PLAYING) {
+					producer_unlock();
+					consumer_unlock();
+					break;
+				}
+				size = buffer_get_rpos(&rpos);
+				if (size == 0) {
+					if (ip_eof(ip)) {
+						_consumer_handle_eof();
+						producer_unlock();
+						consumer_unlock();
+						break;
+					} else {
+						producer_unlock();
+						_consumer_position_update();
+						consumer_unlock();
+						ms_sleep(10);
+						break;
+					}
+				}
+				producer_unlock();
+			}
+			if (size > space)
+				size = space;
+			if (soft_vol || replaygain)
+				scale_samples(rpos, (unsigned int *)&size);
+			rc = op_write(rpos, size);
+			if (rc < 0) {
+				d_print("op_write returned %d %s\n", rc, rc == -1 ? strerror(errno) : "");
+				op_close();
+				_consumer_status_update(CS_STOPPED);
+				_consumer_play();
+
+				consumer_unlock();
+				break;
+			}
+			buffer_consume(rc);
+			consumer_pos += rc;
+			space -= rc;
+		}
+	}
+	_consumer_stop();
+	consumer_unlock();
+	return NULL;
+}
+
+static void *producer_loop(void *arg)
+{
+	while (1) {
+		const int chunks = 1;
+		int size, nr_read, i;
+		char *wpos;
+
+		producer_lock();
+		if (!producer_running)
+			break;
+
+		if (producer_status == PS_UNLOADED ||
+			producer_status == PS_PAUSED ||
+			producer_status == PS_STOPPED || ip_eof(ip))  {
+			pthread_cond_wait(&producer_playing, &producer_mutex);
+			producer_unlock();
+			continue;
+		}
+		for (i = 0; ; i++) {
+			size = buffer_get_wpos(&wpos);
+			if (size == 0) {
+				producer_unlock();
+				ms_sleep(50);
+				break;
+			}
+			nr_read = ip_read(ip, wpos, size);
+			if (nr_read < 0) {
+				if (nr_read != -1 || errno != EAGAIN) {
+					player_ip_error(nr_read, "reading file %s",
+									ip_get_filename(ip));
+					nr_read = 0;
+				} else {
+					producer_unlock();
+					ms_sleep(50);
+					break;
+				}
+			}
+			if (ip_metadata_changed(ip))
+				metadata_changed();
+
+			buffer_fill(nr_read);
+			if (nr_read == 0) {
+				producer_unlock();
+				ms_sleep(50);
+				break;
+			}
+			if (i == chunks) {
+				producer_unlock();
+				break;
+			}
+		}
+		_producer_buffer_fill_update();
+	}
+	_producer_unload();
+	producer_unlock();
+	return NULL;
+}
+
+void player_init(void)
+{
+	int rc;
+#ifdef REALTIME_SCHEDULING
+	pthread_attr_t attr;
+#endif
+	pthread_attr_t *attrp = NULL;
+	buffer_nr_chunks = 10 * 44100 * 16 / 8 * 2 / CHUNK_SIZE;
+	buffer_init();
+#ifdef REALTOME_SCHEDULING
+	rc = pthread_attr_init(&attr);
+	BUG_ON(rc);
+	rc = pthread_attr_setschedpolicy(&attr, SCHED_RR);
+	if (rc) {
+		d_print("could not set real-time scheduking priority: %s\n", strerror(rc));
+	} else {
+		struct sched_param param;
+		d_print("using real_time scheduling\n");
+		param.sched_priority = sched_get_priority_max(SCHED_RR);
+		d_print("setting priority to %d\n", param.sched_priority);
+		rc = pthread_attr_setschedparam(&attr, &param);
+		BUG_ON(rc);
+		attrp = &attr;
+	}
+#endif
+
+	rc = pthread_create(&producer_thread, NULL, producer_loop, NULL);
+	BUG_ON(rc);
+
+	rc = pthread_create(&consumer_thread, attrp, consumer_loop, NULL);
+	if (rc && attrp) {
+		d_print("could not create thread using real-time scheduling: %s\n", strerror(rc));
+		rc = pthread_create(&consumer_thread, NULL, consumer_loop, NULL);
+	}
+	BUG_ON(rc);
+
+	player_lock();
+	_player_status_changed();
+	player_unlock();
+}
+
+void player_exit(void)
+{
+	int rc;
+
+	player_lock();
+	consumer_running = 0;
+	pthread_cond_broadcast(&consumer_playing);
+	producer_running = 0;
+	pthread_cond_broadcast(&producer_playing);
+	player_unlock();
+
+	rc = pthread_join(consumer_thread, NULL);
+	BUG_ON(rc);
+	rc = pthread_join(producer_thread, NULL);
+	BUG_ON(rc);
+	buffer_free();
+}
+
+void player_stop(void)
+{
+	player_lock();
+	_consumer_stop();
+	_producer_stop();
+	_player_status_changed();
+	player_unlock();
+}
+
+void player_play(void)
+{
+	int prebuffer;
+
+	player_lock();
+	if (producer_status == PS_PLAYING && ip_is_remote(ip)) {
+		player_unlock();
+		return;
+	}
+	prebuffer = consumer_status == CS_STOPPED;
+	_producer_play();
+	if (producer_status == PS_PLAYING) {
+		_consumer_play();
+		if (consumer_status != CS_PLAYING)
+			_producer_stop();
+	} else {
+		_consumer_stop();
+	}
+	_player_status_changed();
+	if (consumer_status == CS_PLAYING && prebuffer)
+		_prebuffer();
+	player_unlock();
+}
+
+void player_pause(void)
+{
+	if (ip && ip_is_remote(ip) && consumer_status == CS_PLAYING) {
+		player_stop();
+		return;
+	}
+	player_lock();
+
+	if (consumer_status == CS_STOPPED) {
+		_producer_play();
+		if (producer_status == PS_PLAYING) {
+			_consumer_play();
+			if (consumer_status != CS_PLAYING)
+				_producer_stop();
+		}
+		_player_status_changed();
+		if (consumer_status == CS_PLAYING)
+			_prebuffer();
+		player_unlock();
+		return;
+	}
+	_producer_pause();
+	_consumer_pause();
+	_player_status_changed();
+	player_unlock();
+}
+
+void player_pause_playback(void)
+{
+	if (consumer_status == CS_PLAYING)
+		player_pause();
+}
+
+void player_set_file(struct track_info *ti)
+{
+	player_lock();
+	_producer_set_file(ti);
+	if (producer_status == PS_UNLOADED) {
+		_consumer_stop();
+		goto out;
+	}
+
+	if (consumer_status == CS_PLAYING || consumer_status == CS_PAUSED) {
+		op_drop();
+		_producer_play();
+		if (producer_status == PS_UNLOADED) {
+			_consumer_stop();
+			goto out;
+		}
+		change_sf(1);
+	}
+out:
+	_player_status_changed();
+	if (producer_status == PS_PLAYING)
+		_prebuffer();
+	player_unlock();
+}
+
+void player_play_file(struct track_info *ti)
+{
+	player_lock();
+	_producer_set_file(ti);
+	if (producer_status == PS_UNLOADED) {
+		_consumer_stop();
+		goto out;
+	}
+
+	_producer_play();
+	if (producer_status == PS_UNLOADED) {
+		_consumer_stop(0;
+				goto out;
+	}
+
+	if (consumer_status == CS_STOPPED) {
+		_consumer_play();
+		if (consumer_status == CS_STOPPED)
+			_producer_stop();
+	} else {
+		op_drop();
+		change_sf(1);
+	}
+
+out:
+	_player_status_changed();
+	if (producer_status == PS_PLAYING)
+		_prbuffer();
+		player_unlock();
+}
+
+void player_file_changed(struct track_info *ti)
+{
+	_file_changed(ti);
+}
+
+void player_seek(double offset, int relative, int start_playing)
+{
+	int stopped = 0;
+	player_lock();
+	if (consumer_status == CS_STOPPED) {
+		stopped = 1;
+		_producer_play();
+		if (producer_status == PS_PLAYING) {
+			_consumer_play();
+			if (consumer_status != CS_PLAYING) {
+				_producer_stop();
+				player_unlock();
+				return;
+			} else 
+				_player_status_changed();
+		}
+	}
+	if (consumer_status == CS_PLAYING || consumer_status == CS_PAUSED) {
+		double pos, duration, new_pos;
+		int rc;
+
+		pos = (double)consumer_pos / (double)buffer_second_size();
+		duration = ip_duration(ip);
+		if (duration < 0) {
+			d_print("can't seek\n");
+			player_unlock();
+			return;
+		}
+		if (relative) {
+			new_pos = pos + offset;
+			if (new_pos < 0.0)
+				new_pos = 0.0;
+			if (offset > 0.0) {
+				if (new_pos > duration - 5.0)
+					new_pos = duration - 5.0;
+				if (new_pos < 0.0)
+					new_pos = 0.0;
+				if (new_pos < pos - 0.5) {
+					d_print("must seek at least 0.5s\n");
+					player_unlock();
+					return;
+				}
+			}
+		}
 	}
 }
