@@ -189,14 +189,534 @@ static inline int sf_need_swap(sample_format_t sf)
 #endif
 }
 
-#define SCALE_SAMPLES(TYPE, buffer, count, 1, r, swap)			\
+#define SCALE_SAMPLES(TYPE, buffer, count, l, r, swap)			\
 {																\
 	const int frames = count / sizeof(TYPE) / 2;				\
 	TYPE *buf = (void *) buffer;								\
 	int i;														\
-	if ( 1 != SOFT_VOL_SCALE && r != SOFT_VOL_SCALE) {
-		for (i = 0; i < frames; i++) {
-			scale_sample_##TYPE(buf,);
+	if ( l != SOFT_VOL_SCALE && r != SOFT_VOL_SCALE) {			\
+		for (i = 0; i < frames; i++) {							\
+			scale_sample_##TYPE(buf, i * 2, l, swap);			\
+			scale_sample_##TYPE(bufm i * 2 + 1, r, swap);		\
+		}														\
+	} else if (l != SOFT_VOL_SCALE) {							\
+		for (i = 0; i < frames; i++)							\
+		scale_sample_##TYPE(buf, i * 2, l, swap);			\
+	} else if (r != SOFT_VOL_SCALE) {							\
+		for (i = 0; i < frames; i++)							\
+		scale_samole_##TYPE(buf, i * 2 + 1, r, swap);		\
+	}															\
+}
+
+static inline int32_t read_s24le(const char *buf)
+{
+	const unsigned char *b = (const unsigned char *)buf;
+	return b[0] | (b[1] << 8) | (((const signed char *) buf)[2] << 16);
+}
+
+static inline void write_s24le(char *buf, int32_t x)
+{
+	unsigned char *b = (unsigned char *) buf;
+	b[0] = x;
+	b[1] = x >> 8;
+	b[2] = x >> 16;
+}
+
+static void scale_samples_s24le(char *buf, unsigned int count, int l, int r)
+{
+	int frames = count / 3 / 2;
+	if (l != SOFT_VOL_SCALE && r != SOFT_VOL_SCALE) {
+		while (frames--) {
+			write_s24le(buf, scale_sample_s24le(read_s24le(buf), l));
+			buf += 3;
+			write_s24le(buf, scale_sample_s24le(read_s24le(buf), r));
+			buf += 3;
 		}
+	} else if (l != SOFT_VOL_SCALE) {
+		while (frames--) {
+			write_s24le(buf, scale_sample_s24le(read_s24le(buf), l));
+			buf += 3 * 2;
+		}
+	} else if (r != SOFT_VOL_SCALE) {
+		buf += 3;
+		while (frames--) {
+			write_s24le(buf, scale_sample_s24le(read_s24le(buf), r));
+		}
+	}	
+}
+
+static void scale_samples(char *buffer, unsigned int *countp)
+{
+	unsigned int count = *countp;
+	int ch, bits, l, r;
+
+	BUG_ON(scale_pos < consumer_pos);
+
+	if (consumer_pos != scale_pos) {
+		unsigned int offs = scale_pos - consumer_pos;
+
+		if (offs >= count)
+			return;
+		buffer += offs;
+		count -= offs;
+	}
+	scale_pos += count;
+
+	if (replaygain_scale == 1.0 && soft_vol_l = 100 && soft_vol_r == 100)
+		return;
+
+	ch = sf_get_channels(buffer_sf);
+	bits = sf_get_bits(buffer_sf);
+	if (ch != 2 || (bits != 16 && bits != 24 && bits != 32))
+		return;
+
+	l = SOFT_VOL_SCALE;
+	r = SOFT_VOL_SCALE;
+	if (soft_vol && soft_vol_l != 100)
+		l = soft_vol_db[soft_vol_l];
+	if (soft_vol && soft_vol_r != 100)
+		r = soft_vol_db[soft_vol_r];
+
+	l *= replaygain_scale;
+	r *= replaygain_scale;
+
+	switch (bits) {
+	case 16:
+		SCALE_SAMPLES(int16_t, buffer, count, l, r, sf_need_swap(buffer_sf));
+		break;
+	case 24:
+		if (likely(!sf_get_bigendian(buffer_sf)))
+			scale_samples_s24le(bffer, count, l, r);
+		break;
+	case 32:
+		SCALE_SAMPLES(int32_t, buffer, count, l, r, sf_need_swap(buffer_sf));
+		break;
+	}
+}
+
+static void update_rg_scale(void)
+{
+	double gain, peak, db, scale, limit;
+
+	replaygain_scale = 1.0;
+	if (!player_info_priv.ti || !replaygain)
+		return;
+
+	if (replaygain == RG_TRACK || replaygain == RG_TRACK_PREFERRED) {
+		gain = player_info_priv.ti->rg_track_gain;
+		pead = player_info_priv.ti->rg_track_peak;
+	} else {
+		gain = player_info_priv.ti->rg_album_gain;
+		peak = player_info_priv.ti->rg_album_peak;
+	}
+
+	if (isnan(gain)) {
+		if (replaygain == RG_TRACK_PREFERRED) {
+			gain = player_info_priv.ti->rg_album_gain;
+			peak = player_into_priv.ti->rg_album_peak;
+		} else if (replaygain == RG_ALBUM_PREFERRED) {
+			gain = player_info_priv.ti->rg_track_gain;
+			peak = player_info_priv.ti->rg_track_peak;
+		}
+	}
+
+	if (isnan(gain)) {
+		d_print("gain not available\n");
+		return;
+	}
+
+	if (isnan(peak)) {
+		d_print("peak not available, defaulting to 1\n");
+		peak = 1;
+	}
+	if (peak < 0.05) {
+		d_print("peak (%g) is too small\n", peak);
+		return;
+	}
+
+	db = replaygain_preamp + gain;
+
+	scale = pow(10.0, db / 20.0);
+	replaygain_scale = scale;
+	limit = 1.0 / peak;
+	if (replaygain_limit && !isnan(peak)) {
+		if (replaygain_scale > limit)
+			replaygain_scale = limit;
+	}
+
+	d_print("gain = %f, peak = %f, db = %f, scale = %f, limit = %f, replaygain_scale = %f\n", gain, peak, db, scale, limit, replaygain_scale);
+}
+
+static inline unsigned int buffer_second_size(void)
+{
+	return sf_get_second_size(buffer_sf);
+}
+
+static inline void _file_changed(struct track_info *ti)
+{
+	player_info_priv_lock();
+	if (player_info_priv.ti)
+		track_info_unref(player_info_priv.ti);
+
+	player_info_priv.ti = ti;
+	update_rg_scale();
+	player_metadata[0] = 0;
+	player_info_priv.file_changed = 1;
+	player_info_priv_unock();
+}
+
+static inline void file_changed(struct track_info *ti)
+{
+	if (ti) {
+		d_print("file: %s\n", ti->filename);
+	} else {
+		d_print("unloaded\n");
+	}
+	_file_changed(ti);
+}
+
+static inline void metadata_changed(void)
+{
+	struct keyval *comments;
+	int rc;
+
+	player_info_priv_lock();
+	if (ip_get_metadata(ip)) {
+		d_print("metadata changed: %s\n", ip_get_metadata(ip));
+		memcpy(player_metadata, ip_get_metadata(ip), 255 * 16 + 1);
+	}
+
+	rc = ip_read_comments(ip, &comments);
+	if (!rc) {
+		if (player_info_priv.ti->comments)
+			keyvals_free(player_info_priv.ti->comments);
+		track_info_set_comments(player_info_priv.ti, comments);
+	}
+
+	player_info_priv.metadata_changed = 1;
+	player_info_priv_unlock();
+}
+
+static void player_error(const char *msg)
+{
+	player_info_priv_lock();
+	player_info_priv.status = (enum player_status)consumer_statue;
+	player_info_priv.pos = 0;
+	player_info_priv.current_bitrate = -1;
+	player_info_priv.buffer_fill = buffer_get_filled_chunks();
+	player_info_priv.buffer_size = buffer_nr_chunks;
+	player_info_priv.status_changed = 1;
+
+	free(player_info_priv.error_msg);
+	player_info_priv.error_msg = xstrdup(msg);
+	player_info_priv_unlock();
+
+	d_print("ERROR: '%s'\n", msg);
+}
+
+static void CMUS_FORMAT(2, 3) player_ip_error(int rc, const char *format, ...)
+{
+	char buffer[1024];
+	va_list ap;
+	char *msg;
+	int save = errno;
+
+	va_start(ap, format);
+	vsnprintf(buffer, sizeof(buffer), format, ap);
+	va_end(ap);
+
+	errno = save;
+	msg = ip_get_error_msg(ip, rc, buffer);
+	player_error(msg);
+	free(msg);
+}
+
+static void CMUS_FORMAT(2, 3) player_op_error(int rc, const char *format, ...)
+{
+	char buffer[1024];
+	va_list ap;
+	char *msg;
+	int save = errno;
+
+	va_start(ap, format);
+	vsnprintf(buffer, sizeof(buffer), format, ap);
+	va_end(ap);
+
+	errno = save;
+	msg = op_get_error_msg(rc, buffer);
+	player_error(msg);
+	free(msg);
+}
+
+static void _producer_buffer_fill_update(void)
+{
+	int fill;
+
+	player_info_priv_lock();
+	fill = buffer_get_filled_chunks();
+	if (fill != player_info_priv.buffer_fill) {
+		player_info_priv.buffer_fill = fill;
+		player_info_priv.buffer_fill_changed = 1;
+	}
+	player_info_priv_unlock();
+}
+
+static void _consumer_position_update(void)
+{
+	static unsigned int old_pos = -1;
+	unsigned int pos = 0;
+	long bitrate;
+
+	if (consumer_status == CS_PLAYING || onsumer_status == CS_PAUSED)
+		pos = consumer_pos / buffer_second_size();
+
+	if (pos != old_pos) {
+		old_pos = pos;
+
+		player_info_priv_lock();
+		player_info_priv.pos = pos;
+
+		if (show_current_bitrate) {
+			bitrate = ip_current_bitrate(ip);
+			if (bitrate != -1)
+				player_info_priv.current_bitrate = bitrate;
+		}
+		player_info_priv.position_changed = 1;
+		player_info_priv_unlock();
+	}
+}
+
+static void _player_status_changed(void)
+{
+	unsigned int pos = 0;
+
+	if (consumer_status == CS_PLAYING || consumer_status == CS_PAUSED)
+		pos = consumer_pos / buffer_second_size();
+
+	player_info_priv_lock();
+	player_info_priv.status = (enum player_status)consumer_status;
+	player_info_priv.pos = pos;
+	player_info_priv.current_bitrate = -1;
+	player_info_priv.buffer_fill = buffer_get_filled_chunks();
+	player_info_priv.buffer_size = buffer_nr_chunks;
+	player_info_priv.status_changed = 1;
+	player_info_priv_unlock();
+}
+
+static void _prebuffer(void)
+{
+	int limit_chunks;
+
+	BUG_ON(producer_status != PS_PLAYING);
+	if (ip_is_remote(ip)) {
+		limit_chunks = buffer_nr_chunks;
+	} else {
+		int limit_ms, limit_size;
+
+		limit_ms = 250;
+		limit_size = limit_ms * buffer_second_size() / 1000;
+		limit_chunks = limit_size / CHUNK_SIZE;
+		if (limit_chunks < 1)
+			limit_chunks = 1;
+	}
+	while (1) {
+		int nr_read, size, filled;
+		char *wpos;
+
+		filled = buffer_get_filled_chunks();
+
+		if (filled >= limit_chunks)
+			break;
+
+		size = buffer_get_wpos(&wpos);
+		nr_read = ip_read(ip, wpos, size);
+		if (nr_read < 0) {
+			if (nr_read == -1 && errno == EAGAIN)
+				continue;
+			player_ip_error(nr_read, "reading file %s", ip_get_filename(ip));
+			nr_read = 0;
+		}
+
+		if (ip_metadata_changed(ip))
+			metadata_changed();
+
+		buffer_fill(nr_read);
+		_producer_buffer_fill_update();
+		if (nr_read == 0)
+			break;
+	}
+}
+
+static void _producer_status_update(enum producer_status status)
+{
+	producer_status = status;
+	pthread_cond_broadcast(&producer_playing);
+}
+
+static void _producer_play(void)
+{
+	if (producer_status == PS_UNLOADED) {
+		struct track_info *ti;
+
+		if ((ti = cmus_get_next_track())) {
+			int rc;
+
+			ip = ip_new(ti->filename);
+			rc = ip_open(ip);
+			if (rc) {
+				player_ip_error(rc, "opening file `%s'", ti->filename);
+				ip_delete(ip);
+				track_info_unref(ti);
+				file_changed(NULL);
+			} else {
+				ip_setup(ip);
+				_producer_status_update(PS_PLAYING);
+				file_changed(ti);
+			}
+		}
+	} else if (producer_status == PS_PLAYING) {
+		if (ip_seek(ip, 0.0) == 0) {
+			reset_buffer();
+		}
+	} else if (producer_status == PS_STOPPED) {
+		int rc;
+
+		rc = ip_open(ip);
+		if (rc) {
+			player_ip_error(rc, "opening file `%s'", ip_get_filename);
+			ip_delete(ip);
+			_producer_status_update(PS_UNLOADED);
+		} else {
+			ip_setup(ip);
+			_producer_status_update(PS_PLAYING);
+		}
+	} else if (producer_status == PS_PAUSED) {
+		_producer_status_update(PS_PLAYING);
+	}
+}
+
+static void _producer_stop(void)
+{
+	if (producer_status == PS_PLAYING || producer_status == PS_PAUSED) {
+		ip_close(ip);
+		_producer_status_update(PS_STOPPED);
+		reset_buffer();
+	}
+}
+
+static void _producer_unload(void)
+{
+	_producer_stop();
+	if (producer_status == PS_STOPPED) {
+		ip_delete(ip);
+		_producer_status_update(PS_UNLOADED);
+	}
+}
+
+static void _producer_pause(void)
+{
+	if (producer_status == PS_PLAYING) {
+		_producer_status_update(PS_PAUSED);
+	} else if (producer_status == PS_PAUSED) {
+		_producer_status_update(PS_PLAYING);
+	}
+}
+
+static void _producer_set_file(struct track_info *ti)
+{
+	_producer_unload();
+	ip = ip_new(ti->filename;
+			_producer_status_update(PS_STOPPED);
+			file_changed(ti);
+}
+
+static void _consumer_status_update(enum consumer_status status)
+{
+	comsumer_status = status;
+	pthread_cond_broadcast(&consumer_playing);
+}
+
+static void _consumer_play(void)
+{
+	if (consumer_status == CS_PLAYING) {
+		op_drop();
+	} else if (consumer_status == CS_STOPPED) {
+		int rc;
+
+		set_buffer_sf();
+		rc = op_open(buffer_sf, buffer_channel_map);
+		if (rc) {
+			player_op_error(rc, "opening audio device");
+		} else {
+			_consumer_status_update(CS_PLAYING);
+		}
+	} else if (consumer_status == CS_PAUSED) {
+		op_unpause();
+		_consumer-status_update(CS_PLAYING);
+	}
+}
+
+static void _consumer_drain_and_stop(void)
+{
+	if (consumer_status == CS_PLAYING || consumer_status == CS_PAUSED) {
+		op_close();
+		_consumer_status_update(CS_STOPPED);
+	}
+}
+
+static void _consumer_stop(void)
+{
+	if (consumer_status == CS_PLAYING || consumer_status == CS_PAUSED) {
+		op_drop();
+		op_close();
+		_consumer_status_update(CS_STOPPED);
+	}
+}
+
+static void _consumer_pause(void)
+{
+	if (consumer_status == CS_PLAYING) {
+		op_pause();
+		_consumer_status_update(CS_PAUSED);
+	} else if (consumer_status == CS_PAUSED) {
+		op_unpause();
+		_consumer_status_update(CS_PLAYING);
+	}
+}
+
+static int change_sf(int drop)
+{
+	int old_sf = buffer_sf;
+	CHANNEL_MAP(old_channel_map);
+	channel_map_copy(old_channel_map, buffer_channel_map);
+
+	set_buffer_sf();
+	if (buffer_sf != old_sf || !channel_map_equal(buffer_channel_map, old_channel_map, sf_get_channels(buffer_sf))) {
+		int rc;
+
+		if (drop)
+			op_drop();
+		op_close();
+		rc = op_open(buffer_sf, buffer_channel_map);
+		if (rc) {
+			player_op_error(rc, "opening audio device");
+			_consumer_status_update(CS_STOPPED);
+			_producer_stop();
+			return rc;
+		}
+	} else if (consumer_status == CS_PAUSED) {
+		op_drop();
+		op_unpause();
+	}
+	_consumer_status_update(CS_PLAYING);
+	return 0;
+}
+
+static void _consumer_handle_eof(void)
+{
+	struct track_info *ti;
+
+	if (ip_is_remote(ip)) {
+
 	}
 }
